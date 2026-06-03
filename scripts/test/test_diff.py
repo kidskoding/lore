@@ -533,6 +533,54 @@ def test_file_diff_context(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_file_diff_blank_context_line_has_sentinel(new_lore_repo):
+    """Blank context lines must be emitted as " \\n" (leading-space sentinel),
+    not a bare "\\n". Standard unified-diff parsers require every hunk-body line
+    to begin with ' ', '+', '-', or '\\'; a bare blank line makes them under-count
+    rows so downstream line numbers drift. Regression for CROWD CR-1860."""
+    repo: Lore = new_lore_repo()
+
+    test_file = "blank_ctx.txt"
+    repo.write_commit_push(
+        "Initial commit",
+        {test_file: ["alpha\n", "\n", "bravo\n"]},
+        offline=True,
+    )
+
+    # Non-whitespace change on line 1; blank line 2 stays as context.
+    with repo.open_file(test_file, "w+") as output_file:
+        output_file.writelines(["ALPHA\n", "\n", "bravo\n"])
+
+    expected = (
+        "@@ -1,3 +1,3 @@\n"
+        + "-alpha\n"
+        + "+ALPHA\n"
+        + " \n"  # blank context line keeps the leading-space sentinel
+        + " bravo\n"
+    )
+
+    # Default path (diffy native formatter).
+    output = repo.file_diff(test_file, offline=True)
+    assert expected in output, (
+        "Default path: blank context line must be ' \\n', not bare '\\n'\n"
+        + "Expected:\n"
+        + expected
+        + "\nOutput:\n"
+        + repr(output)
+    )
+
+    # Ignore-whitespace path (format_patch_preserving_originals / write_patch_line).
+    output_ws = repo.file_diff(test_file, ignore_space_at_eol=True, offline=True)
+    assert expected in output_ws, (
+        "Ignore-whitespace path: blank context line must be ' \\n', not bare '\\n'\n"
+        + "Expected:\n"
+        + expected
+        + "\nOutput:\n"
+        + repr(output_ws)
+    )
+
+
+@pytest.mark.smoke
 def test_file_diff_ignore_space_at_eol(new_lore_repo):
     """--ignore-space-at-eol suppresses lines that differ only in trailing whitespace."""
     repo: Lore = new_lore_repo()

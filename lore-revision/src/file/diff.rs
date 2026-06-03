@@ -683,9 +683,16 @@ fn emit_diff_event(
             None => return false,
         }
     } else {
-        let s = diffy::DiffOptions::new()
+        // diffy's `Display`/`to_string()` defaults to `suppress_blank_empty: true`,
+        // which drops the leading space on blank context lines (bare `\n`). Standard
+        // unified-diff parsers require every hunk-body line to start with a sentinel
+        // (' ', '+', '-', '\'), so format explicitly with suppression disabled.
+        let patch = diffy::DiffOptions::new()
             .set_context_len(options.context_lines as usize)
-            .create_patch(old, new)
+            .create_patch(old, new);
+        let s = diffy::PatchFormatter::new()
+            .suppress_blank_empty(false)
+            .fmt_patch(&patch)
             .to_string();
         if s.ends_with("+++ modified\n") {
             return false;
@@ -831,16 +838,13 @@ fn collapse_inline_whitespace(s: &str) -> String {
     out
 }
 
-/// Writes one unified-diff line, mirroring diffy's default formatter:
-/// - bare `\n` context lines drop the leading space (`suppress_blank_empty`),
-/// - lines without a trailing `\n` get a `\ No newline at end of file` marker.
+/// Writes one unified-diff line. Every hunk-body line begins with its sentinel
+/// (' ', '+', '-') — including blank context lines, which are emitted as `" \n"`
+/// so standard unified-diff parsers count them as rows. Lines without a trailing
+/// `\n` get a `\ No newline at end of file` marker.
 fn write_patch_line(out: &mut String, sign: char, line: &str) {
-    if sign == ' ' && line == "\n" {
-        out.push('\n');
-    } else {
-        out.push(sign);
-        out.push_str(line);
-    }
+    out.push(sign);
+    out.push_str(line);
     if !line.ends_with('\n') {
         out.push('\n');
         out.push_str("\\ No newline at end of file\n");
