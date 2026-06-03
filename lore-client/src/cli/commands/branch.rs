@@ -1298,9 +1298,14 @@ pub fn handle_branch_list(globals: LoreGlobalArgs, args: &BranchListArgs) -> u8 
     };
 
     let deleted_section = std::sync::atomic::AtomicBool::new(false);
+    let remote_seen = std::sync::atomic::AtomicBool::new(false);
+    let warn_on_missing_remote = !globals.local() && !globals.remote() && !globals.offline();
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::BranchListBegin(data) => {
+                if data.location == LoreBranchLocation::Remote {
+                    remote_seen.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 if data.location == LoreBranchLocation::Local
                     && deleted_section.load(std::sync::atomic::Ordering::Relaxed)
                 {
@@ -1349,7 +1354,16 @@ pub fn handle_branch_list(globals: LoreGlobalArgs, args: &BranchListArgs) -> u8 
                     }
                 }
             }
-            LoreEvent::Complete(_) => {}
+            LoreEvent::Complete(_) => {
+                if warn_on_missing_remote && !remote_seen.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    println!(
+                        "{}Warning: Could not query remote branch list{}",
+                        LogStyles::WARNING,
+                        anstyle::Reset,
+                    );
+                }
+            }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
             }

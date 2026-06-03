@@ -266,6 +266,7 @@ async fn list_local(
         branch::list_output(
             repository,
             execution_context().globals().local(),
+            execution_context().globals().remote(),
             args.deleted != 0,
         )
     })

@@ -9,7 +9,6 @@ pub mod push;
 pub mod reset;
 
 use std::cmp::PartialEq;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str;
@@ -1987,8 +1986,13 @@ pub async fn list_remote(
 pub async fn list_output(
     repository: Arc<RepositoryContext>,
     local: bool,
+    remote: bool,
     deleted: bool,
 ) -> Result<(), BranchError> {
+    if remote {
+        return list_remote_output(repository, true).await;
+    }
+
     // List local branches
     event::LoreEvent::BranchListBegin(LoreBranchListBeginEventData {
         location: LoreBranchLocation::Local,
@@ -1999,7 +2003,7 @@ pub async fn list_output(
         .await
         .forward::<BranchError>("Failed to deserialize current revision anchor")?;
 
-    let active_metadata_keys = Arc::new(dashmap::DashSet::new());
+    let active_ids = Arc::new(dashmap::DashSet::<BranchId>::new());
     let count = Arc::new(AtomicUsize::new(0));
     const MAX_TASKS: usize = 100;
     let mut tasks = JoinSet::new();
@@ -2007,11 +2011,10 @@ pub async fn list_output(
     while let Some(id) = metadata_stream.next().await {
         let repository = repository.clone();
         let count = count.clone();
-        let active_metadata_keys = active_metadata_keys.clone();
+        let active_ids = active_ids.clone();
         lore_spawn!(tasks, async move {
             if deleted {
-                let (metadata_key, _) = mutable_key(repository.salt(), METADATA, repository.id, id);
-                active_metadata_keys.insert(metadata_key);
+                active_ids.insert(id);
             }
 
             let metadata_hash = metadata_hash(repository.clone(), id).await?;
@@ -2071,8 +2074,6 @@ pub async fn list_output(
         })
         .send();
 
-        let active_keys: HashSet<Hash> = active_metadata_keys.iter().map(|k| *k).collect();
-
         let all_metadata_stream = repository
             .read_mutable_store()
             .list(repository.id, KeyType::BranchMetadata)
@@ -2082,13 +2083,10 @@ pub async fn list_output(
         let deleted_count = Arc::new(AtomicUsize::new(0));
         let mut deleted_tasks = JoinSet::new();
         let mut all_metadata = UnboundedReceiverStream::new(all_metadata_stream.channel());
-        while let Some((key, value)) = all_metadata.next().await {
-            if active_keys.contains(&key) {
-                continue;
-            }
-
+        while let Some((_key, value)) = all_metadata.next().await {
             let repository = repository.clone();
             let deleted_count = deleted_count.clone();
+            let active_ids = active_ids.clone();
             lore_spawn!(deleted_tasks, async move {
                 let metadata = load_metadata(repository.clone(), value).await;
                 let Ok(metadata) = metadata else {
@@ -2099,6 +2097,10 @@ pub async fn list_output(
                     return Ok(());
                 };
                 let id: BranchId = id_bytes.into();
+
+                if active_ids.contains(&id) {
+                    return Ok(());
+                }
 
                 let name = branch::name(&metadata)?;
                 let category = branch::category(&metadata).unwrap_or(branch::default_category());
@@ -2153,46 +2155,64 @@ pub async fn list_output(
         return Ok(());
     }
 
-    // List remote branches
-    if let Ok(remote) = repository.remote().await {
-        event::LoreEvent::BranchListBegin(LoreBranchListBeginEventData {
+    list_remote_output(repository, false).await
+}
+
+/// Emit the remote branch list. When `required` (an explicit `--remote`), a
+/// missing connection or a failed remote listing is propagated as an error;
+/// otherwise the remote is optional and such failures emit no remote events.
+async fn list_remote_output(
+    repository: Arc<RepositoryContext>,
+    required: bool,
+) -> Result<(), BranchError> {
+    let remote = match repository.remote().await {
+        Ok(remote) => remote,
+        Err(_) if !required => return Ok(()),
+        connection => connection.forward::<BranchError>("Failed to connect to remote")?,
+    };
+
+    let list = match list_remote(remote, repository.id).await {
+        Ok(list) => list,
+        Err(err) if required => return Err(err),
+        Err(_) => return Ok(()),
+    };
+
+    event::LoreEvent::BranchListBegin(LoreBranchListBeginEventData {
+        location: LoreBranchLocation::Remote,
+    })
+    .send();
+
+    for entry in &list {
+        let id = entry.id;
+        let name = &entry.name;
+        let category = &entry.category;
+        let latest = entry.latest;
+        let creator = &entry.creator;
+        let created = entry.created;
+        let stack = &entry.stack;
+
+        event::LoreEvent::BranchListEntry(LoreBranchListEntryEventData {
             location: LoreBranchLocation::Remote,
-        })
-        .send();
-
-        let list = list_remote(remote, repository.id).await.unwrap_or_default();
-        for entry in &list {
-            let id = entry.id;
-            let name = &entry.name;
-            let category = &entry.category;
-            let latest = entry.latest;
-            let creator = &entry.creator;
-            let created = entry.created;
-            let stack = &entry.stack;
-
-            event::LoreEvent::BranchListEntry(LoreBranchListEntryEventData {
-                location: LoreBranchLocation::Remote,
-                id,
-                name: name.into(),
-                category: category.into(),
-                latest,
-                creator: creator.into(),
-                created,
-                stack: LoreArray::<LoreBranchPoint>::from_vec(
-                    stack.iter().map(LoreBranchPoint::from).collect(),
-                ),
-                is_current: 0,
-                deleted: 0,
-            })
-            .send();
-        }
-
-        event::LoreEvent::BranchListEnd(LoreBranchListEndEventData {
-            location: LoreBranchLocation::Remote,
-            count: list.len() as u64,
+            id,
+            name: name.into(),
+            category: category.into(),
+            latest,
+            creator: creator.into(),
+            created,
+            stack: LoreArray::<LoreBranchPoint>::from_vec(
+                stack.iter().map(LoreBranchPoint::from).collect(),
+            ),
+            is_current: 0,
+            deleted: 0,
         })
         .send();
     }
+
+    event::LoreEvent::BranchListEnd(LoreBranchListEndEventData {
+        location: LoreBranchLocation::Remote,
+        count: list.len() as u64,
+    })
+    .send();
 
     Ok(())
 }

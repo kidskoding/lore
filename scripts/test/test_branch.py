@@ -490,49 +490,113 @@ def test_branch_list_deleted(new_lore_repo):
         {"file.txt": ["content\n"]},
     )
 
-    # Create a branch, switch back to main, and delete it locally
+    def local_branch_sets() -> tuple[set[str], set[str]]:
+        """Active-local and deleted-local branch names from branch list --deleted."""
+        output = repo.branch_list(deleted=True, json=True)
+        local = [
+            e
+            for e in parse_jsonl(output, "branchListEntry")
+            if e["location"] == "local"
+        ]
+        active = {e["name"] for e in local if not e["deleted"]}
+        deleted = {e["name"] for e in local if e["deleted"]}
+        return active, deleted
+
+    # Before any deletion: the default branch is active, nothing is deleted, and
+    # the active and deleted lists are disjoint.
+    active, deleted = local_branch_sets()
+    assert "main" in active, "Active branch 'main' should appear in the local list"
+    assert not deleted, f"No branch should be deleted before any deletion; got {deleted}"
+    assert active.isdisjoint(deleted), (
+        f"A branch must appear in either the local or deleted list, never both; "
+        f"overlap={active & deleted}"
+    )
+
+    # A newly created branch joins the active list and stays out of the deleted list.
     repo.branch_create("to-delete")
     repo.branch_switch("main")
+    active, deleted = local_branch_sets()
+    assert "to-delete" in active, "Newly created branch should be in the active list"
+    assert "to-delete" not in deleted, "Newly created branch should not be deleted"
+    assert active.isdisjoint(deleted), (
+        f"A branch must appear in either the local or deleted list, never both; "
+        f"overlap={active & deleted}"
+    )
+
+    # Without --deleted, no entry is ever flagged deleted.
+    entries = parse_jsonl(repo.branch_list(json=True), "branchListEntry")
+    assert not any(e["deleted"] for e in entries), (
+        "No branch should be flagged deleted without the --deleted flag"
+    )
+
+    # Deleting the branch locally removes it from the active list and moves it into
+    # the deleted list; unrelated active branches are untouched and the lists stay
+    # disjoint.
     repo.branch_delete("to-delete", local=True)
-
-    # Without --deleted, the deleted branch should not appear in entry events
-    output = repo.branch_list(json=True)
-    entries = parse_jsonl(output, "branchListEntry")
-    deleted_entries = [e for e in entries if e["deleted"]]
-    assert len(deleted_entries) == 0, (
-        "Deleted branches should not appear without --deleted flag"
+    active, deleted = local_branch_sets()
+    assert "to-delete" not in active, (
+        "Deleted branch should be removed from the active local list"
+    )
+    assert "to-delete" in deleted, "Deleted branch should appear in the deleted list"
+    assert "main" in active, "Unrelated active branch 'main' must stay active"
+    assert "main" not in deleted, "Active branch 'main' must never appear as deleted"
+    assert active.isdisjoint(deleted), (
+        f"A branch must appear in either the local or deleted list, never both; "
+        f"overlap={active & deleted}"
     )
 
-    # With --deleted, the deleted branch should appear with deleted=true
-    output = repo.branch_list(deleted=True, json=True)
-    entries = parse_jsonl(output, "branchListEntry")
-    active_entries = [e for e in entries if not e["deleted"]]
-    deleted_entries = [e for e in entries if e["deleted"]]
-
-    assert not any(e["name"] == "to-delete" for e in active_entries), (
-        "Deleted branch should not appear as active"
+    # The deleted entry is reported at the local location.
+    deleted_entry = next(
+        e
+        for e in parse_jsonl(repo.branch_list(deleted=True, json=True), "branchListEntry")
+        if e["location"] == "local" and e["deleted"] and e["name"] == "to-delete"
     )
-    assert any(e["name"] == "to-delete" for e in deleted_entries), (
-        "Deleted branch should appear with deleted=true"
-    )
-
-    deleted_entry = next(e for e in deleted_entries if e["name"] == "to-delete")
     assert deleted_entry["location"] == "local", (
         "Deleted branch location should be local"
     )
 
-    # Create another branch and delete it to verify multiple deleted branches
+    # A second deletion adds to the deleted list; lists remain disjoint throughout.
     repo.branch_create("to-delete-2")
     repo.branch_switch("main")
     repo.branch_delete("to-delete-2", local=True)
+    active, deleted = local_branch_sets()
+    assert {"to-delete", "to-delete-2"} <= deleted, (
+        f"Both deleted branches should appear in the deleted list; got {deleted}"
+    )
+    assert "main" in active, "Active branch 'main' should remain in the local list"
+    assert active.isdisjoint(deleted), (
+        f"A branch must appear in either the local or deleted list, never both; "
+        f"overlap={active & deleted}"
+    )
 
-    output = repo.branch_list(deleted=True, json=True)
-    entries = parse_jsonl(output, "branchListEntry")
-    deleted_entries = [e for e in entries if e["deleted"]]
-    deleted_names = {e["name"] for e in deleted_entries}
 
-    assert "to-delete" in deleted_names, "First deleted branch should still appear"
-    assert "to-delete-2" in deleted_names, "Second deleted branch should appear"
+@pytest.mark.smoke
+def test_branch_list_remote_only(new_lore_repo):
+    repo: Lore = new_lore_repo()
+
+    repo.write_commit_push(
+        "Initial commit",
+        {"file.txt": ["content\n"]},
+    )
+
+    # The default listing covers both the local and the remote.
+    default = parse_jsonl(repo.branch_list(json=True), "branchListEntry")
+    assert any(e["location"] == "local" for e in default), (
+        "Default branch list should include local entries"
+    )
+    assert any(e["location"] == "remote" and e["name"] == "main" for e in default), (
+        "Default branch list should include remote entries"
+    )
+
+    # --remote lists the remote only: every entry is remote, with no local section.
+    remote = parse_jsonl(repo.branch_list(remote=True, json=True), "branchListEntry")
+    assert remote, "--remote should list the remote branches"
+    assert all(e["location"] == "remote" for e in remote), (
+        "--remote must emit only remote entries, never a local section"
+    )
+    assert any(e["name"] == "main" for e in remote), (
+        "main should be listed from the remote"
+    )
 
 
 def run_divergent_resolve_test(whose, new_lore_repo):
