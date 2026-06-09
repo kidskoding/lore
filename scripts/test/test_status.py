@@ -279,6 +279,177 @@ def test_status(new_lore_repo):
     )
 
 
+def _status_entries(repo: Lore, **kwargs) -> dict[str, dict]:
+    """Run `status --json` and return every entry keyed by posix path.
+
+    Unlike `_status_files_by_path` this keeps directory entries too, so a
+    test can assert that excluded subtrees produce no stray directory
+    bookkeeping (e.g. phantom deletes) during a `--scan`.
+    """
+    entries = parse_status_json(repo.status(json=True, offline=True, **kwargs))
+    return {to_posix(e.get("path", "")): e for e in entries}
+
+
+@pytest.mark.smoke
+def test_status_scan_view_filter(new_lore_repo, tmp_path_factory):
+    """`status --scan` reconciles a view-filtered clone against the filesystem
+    reporting exactly the changes to materialized (in-view) content and nothing
+    for content the view filter excluded.
+
+    The committed tree mixes top-level files, a deep chain
+    (`assets/d0/d1/d2/d3/deep.txt`), a plainly excluded subtree
+    (`assets/plain/**`), and a `drop/` subtree under which only nested `keep/`
+    directories are re-included (`assets/**/drop/**/keep/`). The view keeps the
+    `assets/` subtree, re-excludes `assets/plain/` and every `drop/`, then
+    re-includes any `keep/` reachable beneath a `drop/`. A clone therefore
+    materializes only `keep_root.txt`, the deep file, `mid/keep/mk.txt`, and the
+    re-included `mid/drop/keep/kd.txt`.
+
+    On a freshly materialized clone `--scan` must report no changes at all: in
+    particular no phantom directory deletes for the excluded `plain/` and
+    `drop/` subtrees that the filesystem never wrote. After genuinely editing
+    three in-view files (a deep modify, an add, a delete) `--scan` must report
+    exactly those three and persist their dirty flags, never surfacing any
+    excluded file or a stray delete for an excluded directory.
+    """
+    repo: Lore = new_lore_repo()
+
+    in_view = [
+        posix_join("assets", "keep_root.txt"),
+        posix_join("assets", "d0", "d1", "d2", "d3", "deep.txt"),
+        posix_join("assets", "mid", "keep", "mk.txt"),
+        posix_join("assets", "mid", "drop", "keep", "kd.txt"),
+    ]
+    excluded = [
+        "root.txt",
+        posix_join("top", "t.txt"),
+        posix_join("assets", "plain", "p1.txt"),
+        posix_join("assets", "plain", "nested", "p2.txt"),
+        posix_join("assets", "mid", "drop", "d1.txt"),
+        posix_join("assets", "mid", "drop", "sub", "d2.txt"),
+    ]
+    for p in in_view + excluded:
+        repo.make_dirs(os.path.dirname(p))
+        with repo.open_file(p, "w+b") as f:
+            f.write(os.urandom(64))
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
+
+    view_dir = tmp_path_factory.mktemp("view")
+    view_path = os.path.join(view_dir, "view.txt")
+    with open(view_path, "w+") as view_file:
+        view_file.write("**\n")
+        view_file.write("!assets/**\n")
+        view_file.write("assets/plain/\n")
+        view_file.write("assets/**/drop/\n")
+        view_file.write("!assets/**/drop/**/keep/\n")
+    clone: Lore = repo.clone(view=view_path)
+
+    # The clone must materialize exactly the in-view set and nothing excluded.
+    for p in in_view:
+        assert clone.file_exists(p), f"view filter dropped an in-view file: {p}"
+    for p in excluded:
+        assert not clone.path_exists(p), f"view filter materialized an excluded file: {p}"
+
+    # A pristine clone is in sync with the filesystem: --scan reports nothing.
+    # Excluded subtrees (plain/, drop/) were never written, so they must not
+    # surface as phantom directory deletes.
+    clean = _status_entries(clone, scan=True)
+    assert clean == {}, f"--scan on a pristine view-filtered clone reported changes: {sorted(clean)}"
+
+    # Genuinely change three in-view files across depths.
+    deep = posix_join("assets", "d0", "d1", "d2", "d3", "deep.txt")
+    added = posix_join("assets", "mid", "keep", "added.txt")
+    deleted = posix_join("assets", "keep_root.txt")
+    with clone.open_file(deep, "w+b") as f:
+        f.write(os.urandom(128))
+    with clone.open_file(added, "w+b") as f:
+        f.write(os.urandom(32))
+    clone.remove_file(deleted)
+
+    scanned = _status_entries(clone, scan=True)
+
+    files = {p: e for p, e in scanned.items() if e.get("type") == "file"}
+    assert set(files) == {to_posix(deep), to_posix(added), to_posix(deleted)}, (
+        f"--scan reported the wrong file set: {sorted(files)}"
+    )
+    assert files[to_posix(deep)]["action"] == "keep"
+    assert files[to_posix(added)]["action"] == "add"
+    assert files[to_posix(deleted)]["action"] == "delete"
+    assert all(e["flagDirty"] is True for e in files.values()), (
+        f"scanned files should be flagged dirty: {files}"
+    )
+
+    # No excluded file may appear, and no excluded directory may be reported as
+    # deleted just because the view filter walked it to reach re-included content.
+    strays = {
+        p: e.get("action")
+        for p, e in scanned.items()
+        if e.get("type") != "file" and e.get("action") == "delete"
+    }
+    assert strays == {}, f"--scan reported stray deletes for excluded directories: {strays}"
+
+    # Suppressing phantom deletes must not hide a real one: removing an entire
+    # materialized in-view directory still reports the directory as deleted.
+    clone.remove_file(posix_join("assets", "mid", "keep", "mk.txt"))
+    clone.remove_file(added)
+    clone.remove_dir(posix_join("assets", "mid", "keep"))
+
+    after_rmdir = _status_entries(clone, scan=True)
+    keep_dir = to_posix(posix_join("assets", "mid", "keep"))
+    assert keep_dir in after_rmdir, (
+        f"a removed in-view directory must report a delete: {sorted(after_rmdir)}"
+    )
+    assert after_rmdir[keep_dir]["type"] == "directory"
+    assert after_rmdir[keep_dir]["action"] == "delete"
+    # The re-included sibling under drop/ is untouched, so it must not appear.
+    assert to_posix(posix_join("assets", "mid", "drop", "keep")) not in after_rmdir, (
+        f"untouched re-included directory should not be reported: {sorted(after_rmdir)}"
+    )
+
+
+@pytest.mark.smoke
+def test_status_scan_view_pure_exclusion(new_lore_repo, tmp_path_factory):
+    """`status --scan` on a pristine clone under a pure-exclusion view reports
+    no changes.
+
+    The view excludes the multi-segment glob `some/path/**/with/*/*`. The
+    ancestor directories of the matched content are not themselves matched by
+    the glob, so they evaluate as "not excluded" even though nothing under them
+    is in view and they were never materialized. Such directories must not be
+    reported as phantom deletes."""
+    repo: Lore = new_lore_repo()
+
+    target = posix_join("some", "path", "is", "excluded", "with", "a", "file.txt")
+    # .../with/a/sub matches the trailing `*/*`, so the directory is excluded and
+    # deep.txt never materializes -- the whole .../with/a subtree is filtered out.
+    deep = posix_join("some", "path", "is", "excluded", "with", "a", "sub", "deep.txt")
+    keep = posix_join("some", "other", "kept.txt")
+    for p in (target, deep, keep):
+        repo.make_dirs(os.path.dirname(p))
+        with repo.open_file(p, "w+b") as f:
+            f.write(os.urandom(64))
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
+
+    view_dir = tmp_path_factory.mktemp("view")
+    view_path = os.path.join(view_dir, "view.txt")
+    with open(view_path, "w+") as view_file:
+        view_file.write("some/path/**/with/*/*\n")
+    clone: Lore = repo.clone(view=view_path)
+
+    assert clone.file_exists(keep), "view dropped an in-view file"
+    assert not clone.path_exists(target), "view materialized an excluded file"
+    assert not clone.path_exists(deep), "view materialized a deeper excluded file"
+
+    clean = _status_entries(clone, scan=True)
+    assert clean == {}, (
+        f"--scan on a pristine view-filtered clone reported changes: {sorted(clean)}"
+    )
+
+
 @pytest.mark.smoke
 def test_status_revision_only(new_lore_repo):
     repo: Lore = new_lore_repo()

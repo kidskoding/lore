@@ -2818,6 +2818,8 @@ fn collect_merge_conflict_files(
             .forward::<MergeError>("getting next child")?
         {
             let child_path = base_path.push_into_buf(&child_name).freeze();
+            // Release the block read lock before recursing (see NodeNameLock docs).
+            drop(child_name);
             let mut child_files = collect_merge_conflict_files(
                 repository.clone(),
                 state.clone(),

@@ -2182,6 +2182,8 @@ pub(crate) fn collect_staged_merge_files(
             .forward::<StageError>("Failed deserializing state node block")?
         {
             let child_path = base_path.push_into_buf(&child_name).freeze();
+            // Release the block read lock before recursing (see NodeNameLock docs).
+            drop(child_name);
             let mut child_files =
                 collect_staged_merge_files(repository.clone(), state.clone(), child_id, child_path)
                     .await?;

@@ -152,7 +152,15 @@ bitflags! {
 bitflagsops!(StateFlags, u32);
 
 /// Iterator over child nodes of a directory, loading blocks with nametable.
-/// Yields `(NodeID, Node, NodeName)` — the child's ID, node data, and borrowed name.
+/// Yields `(NodeID, Node, NodeNameLock)` — the child's ID, node data, and name.
+///
+/// The yielded [`NodeNameLock`] holds a read lock on the node block (zero-copy
+/// name access), not an owned string. Drop it before any call that may take
+/// another lock — recursing into this iterator, or a `State` method that loads a
+/// block such as `block_with_nametable`, which can *write*-lock the same block to
+/// deserialize its nametable. The locks are not reentrant, so holding the name
+/// across such a call (especially an `.await`) risks deadlock. Copy it out with
+/// [`NodeNameLock::freeze`] first if you need it past that point.
 pub struct StateNodeChildrenWithNameIterator {
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
@@ -207,8 +215,10 @@ impl StateNodeChildrenWithNameIterator {
     }
 
     /// Get the next child node with its name.
-    /// The returned `NodeName` holds an arc read lock on the block for
-    /// zero-copy name access. It is `Send` and can be held across `.await`.
+    ///
+    /// The returned [`NodeNameLock`] holds a read lock on the node block. It is
+    /// `Send`, but drop it before any call that may take another lock (see the
+    /// type docs) — copy it out with [`NodeNameLock::freeze`] if needed.
     pub async fn next(&mut self) -> Result<Option<(NodeID, Node, NodeNameLock)>, StateError> {
         loop {
             let Some(node_id) = self.current_node_id else {
@@ -5329,6 +5339,76 @@ async fn diff_filesystem_directory(
     Ok((changes, stats))
 }
 
+/// Whether any node in this subtree would be materialized on disk under the
+/// active filter, mirroring clone/checkout discovery: a file or link
+/// materializes when it is not excluded; a directory materializes when any
+/// descendant materializes, or — when it has no children — when the empty
+/// directory itself is not excluded.
+///
+/// A view re-inclusion that contains a path separator (e.g.
+/// `!a/**/drop/**/keep/`) generates directory-traversal re-inclusion rules for
+/// every ancestor so the materializer can descend excluded directories to
+/// reach the re-included leaves. A side effect is that those ancestor
+/// directories evaluate as "not excluded" even when nothing inside them is in
+/// view. This walk tells a directory that only exists to be traversed (its
+/// whole subtree is filtered out, so it is never written to disk) apart from
+/// one that genuinely holds materialized content, so the filesystem diff does
+/// not report a phantom delete for a directory that was never materialized.
+async fn subtree_materializes(
+    state: Arc<State>,
+    repository: Arc<RepositoryContext>,
+    node_id: NodeID,
+    node: &Node,
+    path: &RelativePath,
+    filter_mode: FilterMode,
+) -> Result<bool, StateError> {
+    if node.is_file() || node.is_link() {
+        return Ok(!repository.filter.excludes(path, false, filter_mode));
+    }
+
+    let mut children =
+        StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), node_id).await?;
+    let mut had_child = false;
+    while let Some((child_id, child_node, child_name)) = children.next().await? {
+        had_child = true;
+        let child_path = path.push_into_buf(&child_name).freeze();
+        // Release the block read lock before recursing (see NodeNameLock docs).
+        drop(child_name);
+        let child_is_directory = child_node.is_directory();
+        // Prune at excluded children like clone/checkout do: an excluded child
+        // is never written, so it cannot make this directory materialize. This
+        // matches what was actually put on disk (a glob can exclude a directory
+        // while not matching a file deeper inside it) and skips excluded
+        // subtrees instead of walking them.
+        if repository
+            .filter
+            .excludes(&child_path, child_is_directory, filter_mode)
+        {
+            continue;
+        }
+        if !child_is_directory {
+            return Ok(true);
+        }
+        if Box::pin(subtree_materializes(
+            state.clone(),
+            repository.clone(),
+            child_id,
+            &child_node,
+            &child_path,
+            filter_mode,
+        ))
+        .await?
+        {
+            return Ok(true);
+        }
+    }
+
+    if !had_child {
+        return Ok(!repository.filter.excludes(path, true, filter_mode));
+    }
+    Ok(false)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn diff_filesystem_directory_walk(
     ctx: &DiffFilesystemContext,
@@ -5646,6 +5726,30 @@ async fn diff_filesystem_directory_walk(
         else {
             continue;
         };
+
+        // A directory that is only "not excluded" because a view re-inclusion
+        // generated traversal rules for it, yet whose entire subtree is
+        // filtered out, was never materialized on disk. Its absence is
+        // expected, not a deletion, so skip it instead of emitting a phantom
+        // delete (which would also recurse into nested excluded directories).
+        if from_node.node.is_directory()
+            && !subtree_materializes(
+                node_list.state.clone(),
+                node_list.repository.clone(),
+                from_named_node.node,
+                &from_node.node,
+                &from_node.path,
+                ctx.filter_mode,
+            )
+            .await?
+        {
+            lore_trace!(
+                "Skipping phantom delete for never-materialized directory {} at {}",
+                from_named_node.node,
+                from_node.path
+            );
+            continue;
+        }
 
         // A leaf node present in state_from but not in state_current, with
         // no file on disk, is an unstaged add that the user reverted by
