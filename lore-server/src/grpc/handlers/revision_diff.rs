@@ -10,7 +10,7 @@ use lore_revision::change;
 use lore_revision::diff;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
-use lore_revision::util::collect_stream::collect_stream;
+use lore_revision::util::collect_stream::collect_stream_with_summary;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -60,12 +60,12 @@ pub async fn handler(
                 .filter_slow_down()?
                 .map_err(|_err| Status::invalid_argument("Invalid to state"))?;
 
-            let result = collect_stream(|tx| {
+            let result = collect_stream_with_summary(|tx| {
                 diff::diff_revision_paths(repository, state_source, state_target, None, tx)
             })
             .await;
             result
-                .map(|mut changes| {
+                .map(|(_, mut changes)| {
                     change::sort_by_path(&mut changes);
                     debug!("Found {} changes", changes.len());
                     Response::new(RevisionDiffResponse {

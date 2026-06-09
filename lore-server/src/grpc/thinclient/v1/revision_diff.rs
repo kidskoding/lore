@@ -44,6 +44,44 @@ use crate::util::setup_execution;
 type RevisionDiffStream =
     Pin<Box<dyn Stream<Item = Result<RevisionDiffResponse, Status>> + Send + 'static>>;
 
+/// Default maximum number of source-side change items the thin-client
+/// `RevisionDiff` handler accepts for a 3-way diff. Diffs whose source
+/// side exceeds this count abort with `Status::resource_exhausted`
+/// before target's walk runs; callers needing unbounded diffs use the
+/// SDK (`lore-capi` or `lore` CLI). Operators can override per
+/// deployment via `feature.revision_diff_source_cap` in the server
+/// config; this constant is the fallback when no override is set.
+///
+/// Default ≈ 100k items × ~232 bytes/`NodeChange` + heap paths ≈ ~50 MB
+/// worst-case for the source `Vec`. See
+/// `docs/specs/streaming-three-way-revision-diff.md` Open Question #3
+/// for calibration discussion.
+pub const DEFAULT_REVISION_DIFF_SOURCE_CAP: usize = 100_000;
+
+/// Resolved tunables for the v1 thin-client `RevisionDiff` handler.
+/// Built once at server start from `FeatureSettings` and threaded
+/// through `LoreThinClientV1Service` into the per-request handler.
+#[derive(Clone, Copy, Debug)]
+pub struct RevisionDiffConfig {
+    /// Source-side change-count cap. The handler passes this to
+    /// `branch::diff3_with_source_cap` so the producer aborts with
+    /// `BranchError::Oversized` before target's walk runs.
+    pub source_cap: usize,
+    /// Permit count for the parallel history-walk semaphore inside
+    /// `revision::diff3_with_source_cap`. `None` falls back to
+    /// `lore_revision::revision::DEFAULT_HISTORY_WALK_CONCURRENCY`.
+    pub history_walk_concurrency: Option<usize>,
+}
+
+impl Default for RevisionDiffConfig {
+    fn default() -> Self {
+        Self {
+            source_cap: DEFAULT_REVISION_DIFF_SOURCE_CAP,
+            history_walk_concurrency: None,
+        }
+    }
+}
+
 /// `lore.thin_client.v1.ThinClientService.RevisionDiff` handler.
 ///
 /// Server-streams a `RevisionDiffHeader` first (echoing both resolved
@@ -66,6 +104,7 @@ pub async fn handler(
     request: Request<RevisionDiffRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    config: RevisionDiffConfig,
 ) -> Result<Response<RevisionDiffStream>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
@@ -109,6 +148,7 @@ pub async fn handler(
                         to_sig,
                         to_id,
                         autoresolve,
+                        config,
                         tx,
                     )
                     .await;
@@ -122,6 +162,7 @@ pub async fn handler(
         .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_diff(
     repository: Arc<RepositoryContext>,
     from_sig: Hash,
@@ -129,6 +170,7 @@ async fn stream_diff(
     to_sig: Hash,
     to_id: model_v1::RevisionIdentifier,
     autoresolve: bool,
+    config: RevisionDiffConfig,
     tx: mpsc::Sender<Result<RevisionDiffResponse, Status>>,
 ) {
     // Identical short-circuit: emit a header-only OK stream.
@@ -189,6 +231,7 @@ async fn stream_diff(
         to_id,
         to_branch,
         autoresolve,
+        config,
         &tx,
     )
     .await
@@ -329,6 +372,7 @@ async fn run_three_way(
     to_id: model_v1::RevisionIdentifier,
     to_branch: BranchId,
     autoresolve: bool,
+    config: RevisionDiffConfig,
     tx: &mpsc::Sender<Result<RevisionDiffResponse, Status>>,
 ) -> Result<(), Status> {
     // Resolve the common-ancestor base up front so we can emit the header
@@ -386,7 +430,7 @@ async fn run_three_way(
     let (producer_tx, mut producer_rx) = mpsc::channel::<Result<DiffItem, BranchError>>(256);
     let repo_clone = repository.clone();
     let producer = lore_spawn!(async move {
-        branch::diff3(
+        Box::pin(branch::diff3_with_source_cap(
             repo_clone,
             from_branch,
             from_sig,
@@ -395,8 +439,10 @@ async fn run_three_way(
             None,
             false,
             autoresolve,
+            Some(config.source_cap),
+            config.history_walk_concurrency,
             producer_tx,
-        )
+        ))
         .await
     });
 
@@ -409,13 +455,7 @@ async fn run_three_way(
                 ?err,
                 "Failed to calculate 3-way revision diff",
             );
-            if err.is_divergent() {
-                Status::failed_precondition(err.to_string())
-            } else if err.is_max_history_search_depth() {
-                Status::resource_exhausted(err.to_string())
-            } else {
-                warn_error_to_status(&err, |e| Status::internal(e.to_string()))
-            }
+            map_branch_error_to_status(err)
         })?;
         let payload = match item {
             DiffItem::Change(change) => Payload::Change(node_change_to_diff_change(&change)),
@@ -440,13 +480,7 @@ async fn run_three_way(
                 ?err,
                 "3-way revision diff producer returned error",
             );
-            Err(if err.is_divergent() {
-                Status::failed_precondition(err.to_string())
-            } else if err.is_max_history_search_depth() {
-                Status::resource_exhausted(err.to_string())
-            } else {
-                warn_error_to_status(&err, |e| Status::internal(e.to_string()))
-            })
+            Err(map_branch_error_to_status(err))
         }
         Err(join_err) => {
             warn!(
@@ -456,6 +490,23 @@ async fn run_three_way(
             );
             Err(Status::internal("revision diff producer task failed"))
         }
+    }
+}
+
+/// Map a `BranchError` from the 3-way diff producer to a gRPC `Status`.
+/// `Oversized` surfaces as `resource_exhausted` so clients can
+/// distinguish "diff too large" from generic internal failures — the
+/// typed variant lets us avoid string-matching the inner `StateError`
+/// across crate boundaries.
+fn map_branch_error_to_status(err: BranchError) -> Status {
+    if err.is_oversized() {
+        Status::resource_exhausted(err.to_string())
+    } else if err.is_divergent() {
+        Status::failed_precondition(err.to_string())
+    } else if err.is_max_history_search_depth() {
+        Status::resource_exhausted(err.to_string())
+    } else {
+        warn_error_to_status(&err, |e| Status::internal(e.to_string()))
     }
 }
 
@@ -697,7 +748,14 @@ mod test {
                 REPOSITORY_ID_KEY,
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
             );
-            let err = match handler(request, immutable_store, mutable_store).await {
+            let err = match handler(
+                request,
+                immutable_store,
+                mutable_store,
+                RevisionDiffConfig::default(),
+            )
+            .await
+            {
                 Ok(_) => panic!("missing query_from must fail"),
                 Err(err) => err,
             };
@@ -737,6 +795,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                RevisionDiffConfig::default(),
             )
             .await
             .expect("handler ok");
@@ -798,6 +857,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                RevisionDiffConfig::default(),
             )
             .await
             .expect("handler ok");
@@ -890,6 +950,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                RevisionDiffConfig::default(),
             )
             .await
             .expect("handler ok");
@@ -983,6 +1044,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                RevisionDiffConfig::default(),
             )
             .await
             .expect("handler ok");
@@ -1040,6 +1102,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                RevisionDiffConfig::default(),
             )
             .await
             {
@@ -1066,7 +1129,14 @@ mod test {
                 REPOSITORY_ID_KEY,
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
             );
-            let err = match handler(request, immutable_store, mutable_store).await {
+            let err = match handler(
+                request,
+                immutable_store,
+                mutable_store,
+                RevisionDiffConfig::default(),
+            )
+            .await
+            {
                 Ok(_) => panic!("missing query_to must fail"),
                 Err(err) => err,
             };
@@ -1122,6 +1192,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                RevisionDiffConfig::default(),
             )
             .await
             .expect("handler ok");
@@ -1217,6 +1288,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                RevisionDiffConfig::default(),
             )
             .await
             .expect("handler ok");

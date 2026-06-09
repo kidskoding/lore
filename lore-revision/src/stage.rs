@@ -832,7 +832,7 @@ pub(crate) async fn stage_merge_path(
         relative_path.as_str(),
     );
 
-    let diff = branch::diff3_collect(
+    let diff = Box::pin(branch::diff3_collect(
         repository.clone(),
         state_merge.branch(repository.clone()).await,
         state_merge.revision(),
@@ -842,7 +842,7 @@ pub(crate) async fn stage_merge_path(
         Some(relative_path),
         true,  /* Include identical changes for merge tracking */
         false, /* Do not autoresolve */
-    )
+    ))
     .await
     .forward::<StageError>("Failed to calculate branch revision diff")?;
 

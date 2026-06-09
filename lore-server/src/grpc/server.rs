@@ -109,6 +109,23 @@ pub struct FeatureSettings {
     /// handler skips the cache fast path and its backfill rebuild;
     /// pushes stop populating cache entries.
     pub revision_list_cache: Option<bool>,
+    /// Maximum source-side change count the v1 `RevisionDiff` 3-way
+    /// handler accepts before aborting with
+    /// `Status::resource_exhausted`. Bounds peak memory on the
+    /// streaming 3-way path. Defaults to
+    /// `DEFAULT_REVISION_DIFF_SOURCE_CAP` (100k items, ≈ 50 MB
+    /// worst-case for the source `Vec` at ~500 B per `NodeChange`).
+    /// SDK callers (`lore-capi`, `lore` CLI) bypass this cap.
+    pub revision_diff_source_cap: Option<usize>,
+    /// Permit count for the semaphore gating parallel
+    /// `is_last_change_merged` history walks inside
+    /// `revision::diff3`. Defaults to
+    /// `lore_revision::revision::DEFAULT_HISTORY_WALK_CONCURRENCY`
+    /// (24, set empirically — see comments in `revision::diff3`).
+    /// Higher values cost RSS per concurrent walk because each
+    /// holds an `Arc<State>` over a deserialised revision blob;
+    /// the wall-clock benefit saturates well below 64.
+    pub revision_diff_history_walk_concurrency: Option<usize>,
 }
 
 /// Toggles for `RevisionList` acceleration features. Resolved once at
@@ -503,10 +520,17 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             acceleration,
             rpc_timeout,
         );
+        let revision_diff_config = crate::grpc::thinclient::v1::revision_diff::RevisionDiffConfig {
+            source_cap: self.0.feature.revision_diff_source_cap.unwrap_or(
+                crate::grpc::thinclient::v1::revision_diff::DEFAULT_REVISION_DIFF_SOURCE_CAP,
+            ),
+            history_walk_concurrency: self.0.feature.revision_diff_history_walk_concurrency,
+        };
         let thin_client_v1_svc = LoreThinClientV1Service::new(
             self.0.immutable_store.clone(),
             self.0.mutable_store.clone(),
             rpc_timeout,
+            revision_diff_config,
         );
         let repository_svc = LoreRepositoryService::new(
             self.0.environment.clone(),

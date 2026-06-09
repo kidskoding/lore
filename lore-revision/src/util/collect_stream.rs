@@ -3,46 +3,46 @@ use std::pin::pin;
 
 use tokio::sync::mpsc;
 
-/// Drain a streaming producer into a `Vec` for callers that do not benefit
-/// from streaming.
+/// Drain a streaming producer into a `Vec` alongside a summary value for
+/// callers that do not benefit from streaming.
 ///
 /// The producer takes an `mpsc::Sender` and emits `Ok(T)` items as it goes,
-/// returning `Ok(())` on success or `Err(E)` on failure. `collect_stream`
-/// runs the producer concurrently with a receive loop in the same task via
-/// `tokio::select!`, so there is no `tokio::spawn` and no `JoinError`. When
-/// the producer completes first, the loop drains any remaining buffered
-/// items before returning.
+/// returning `Ok(S)` on success (where `S` is some summary or metadata
+/// value — use `()` when there is none) or `Err(E)` on failure. Runs the
+/// producer concurrently with a receive loop in the same task via
+/// `tokio::select!`, so there is no `tokio::spawn` and no `JoinError`.
+/// When the producer completes first, the loop drains any remaining
+/// buffered items before returning.
 ///
-/// The first error wins: a producer error or an `Err(E)` item short-circuits
-/// the loop and propagates up.
-pub async fn collect_stream<T, E, Fut>(
+/// Returns `Ok((S, Vec<T>))` — the summary first, then every item the
+/// producer emitted. First error wins: a producer error or an `Err(E)`
+/// item short-circuits the drain and propagates up.
+pub async fn collect_stream_with_summary<T, S, E, Fut>(
     f: impl FnOnce(mpsc::Sender<Result<T, E>>) -> Fut,
-) -> Result<Vec<T>, E>
+) -> Result<(S, Vec<T>), E>
 where
-    Fut: Future<Output = Result<(), E>>,
+    Fut: Future<Output = Result<S, E>>,
 {
     let (tx, mut rx) = mpsc::channel(256);
     let mut driver = pin!(f(tx));
     let mut out = Vec::new();
-    loop {
+    let summary = loop {
         tokio::select! {
             biased;
-            item = rx.recv() => if let Some(item) = item {
-                out.push(item?);
-            } else {
-                (&mut driver).await?;
-                break;
+            item = rx.recv() => match item {
+                Some(item) => out.push(item?),
+                None => break (&mut driver).await?,
             },
             result = &mut driver => {
-                result?;
+                let summary = result?;
                 while let Some(item) = rx.recv().await {
                     out.push(item?);
                 }
-                break;
+                break summary;
             }
         }
-    }
-    Ok(out)
+    };
+    Ok((summary, out))
 }
 
 #[cfg(test)]
@@ -51,56 +51,59 @@ mod tests {
 
     #[tokio::test]
     async fn happy_path_emits_in_order() {
-        let result: Result<Vec<u32>, ()> = collect_stream(|tx| async move {
+        let result: Result<((), Vec<u32>), ()> = collect_stream_with_summary(|tx| async move {
             for n in 0..10 {
                 tx.send(Ok(n)).await.unwrap();
             }
             Ok(())
         })
         .await;
-        assert_eq!(result.unwrap(), (0..10).collect::<Vec<u32>>());
+        assert_eq!(result.unwrap().1, (0..10).collect::<Vec<u32>>());
     }
 
     #[tokio::test]
     async fn empty_producer_yields_empty_vec() {
-        let result: Result<Vec<u32>, ()> = collect_stream(|_tx| async move { Ok(()) }).await;
-        assert_eq!(result.unwrap(), Vec::<u32>::new());
+        let result: Result<((), Vec<u32>), ()> =
+            collect_stream_with_summary(|_tx| async move { Ok(()) }).await;
+        assert_eq!(result.unwrap().1, Vec::<u32>::new());
     }
 
     #[tokio::test]
     async fn item_error_short_circuits() {
-        let result: Result<Vec<u32>, &'static str> = collect_stream(|tx| async move {
-            tx.send(Ok(1)).await.unwrap();
-            tx.send(Err("nope")).await.unwrap();
-            tx.send(Ok(2)).await.unwrap();
-            Ok(())
-        })
-        .await;
+        let result: Result<((), Vec<u32>), &'static str> =
+            collect_stream_with_summary(|tx| async move {
+                tx.send(Ok(1)).await.unwrap();
+                tx.send(Err("nope")).await.unwrap();
+                tx.send(Ok(2)).await.unwrap();
+                Ok(())
+            })
+            .await;
         assert_eq!(result, Err("nope"));
     }
 
     #[tokio::test]
     async fn producer_error_propagates() {
-        let result: Result<Vec<u32>, &'static str> = collect_stream(|tx| async move {
-            tx.send(Ok(1)).await.unwrap();
-            Err("boom")
-        })
-        .await;
+        let result: Result<((), Vec<u32>), &'static str> =
+            collect_stream_with_summary(|tx| async move {
+                tx.send(Ok(1)).await.unwrap();
+                Err("boom")
+            })
+            .await;
         assert_eq!(result, Err("boom"));
     }
 
     #[tokio::test]
     async fn drains_after_producer_finishes() {
-        // Producer fills the channel and returns; collect_stream must drain
+        // Producer fills the channel and returns; the drain must collect
         // the remaining buffered items rather than dropping them.
-        let result: Result<Vec<u32>, ()> = collect_stream(|tx| async move {
+        let result: Result<((), Vec<u32>), ()> = collect_stream_with_summary(|tx| async move {
             for n in 0..50 {
                 tx.send(Ok(n)).await.unwrap();
             }
             Ok(())
         })
         .await;
-        assert_eq!(result.unwrap(), (0..50).collect::<Vec<u32>>());
+        assert_eq!(result.unwrap().1, (0..50).collect::<Vec<u32>>());
     }
 
     #[tokio::test]
@@ -109,14 +112,14 @@ mod tests {
         // `tx.send` must await the receiver between batches. The driver and
         // receiver share a task, so this proves the `tokio::select!` shape
         // makes progress on both branches without deadlock.
-        let result: Result<Vec<u32>, ()> = collect_stream(|tx| async move {
+        let result: Result<((), Vec<u32>), ()> = collect_stream_with_summary(|tx| async move {
             for n in 0..1000 {
                 tx.send(Ok(n)).await.unwrap();
             }
             Ok(())
         })
         .await;
-        assert_eq!(result.unwrap(), (0..1000).collect::<Vec<u32>>());
+        assert_eq!(result.unwrap().1, (0..1000).collect::<Vec<u32>>());
     }
 
     #[tokio::test]
@@ -124,12 +127,13 @@ mod tests {
         // Producer drops the sender, yields once so the receive loop observes
         // the channel close, then returns an error. The driver's error must
         // win even though `rx.recv()` returned `None` first.
-        let result: Result<Vec<u32>, &'static str> = collect_stream(|tx| async move {
-            drop(tx);
-            tokio::task::yield_now().await;
-            Err("boom")
-        })
-        .await;
+        let result: Result<((), Vec<u32>), &'static str> =
+            collect_stream_with_summary(|tx| async move {
+                drop(tx);
+                tokio::task::yield_now().await;
+                Err("boom")
+            })
+            .await;
         assert_eq!(result, Err("boom"));
     }
 
@@ -138,12 +142,39 @@ mod tests {
         // Producer emits a few items, then errors. The returned `Err`
         // takes priority over partial item accumulation; the caller does
         // not see a partial `Vec`.
-        let result: Result<Vec<u32>, &'static str> = collect_stream(|tx| async move {
-            tx.send(Ok(1)).await.unwrap();
-            tx.send(Ok(2)).await.unwrap();
-            Err("boom")
-        })
-        .await;
+        let result: Result<((), Vec<u32>), &'static str> =
+            collect_stream_with_summary(|tx| async move {
+                tx.send(Ok(1)).await.unwrap();
+                tx.send(Ok(2)).await.unwrap();
+                Err("boom")
+            })
+            .await;
+        assert_eq!(result, Err("boom"));
+    }
+
+    #[tokio::test]
+    async fn with_summary_returns_summary_and_items() {
+        let result: Result<(&'static str, Vec<u32>), ()> =
+            collect_stream_with_summary(|tx| async move {
+                for n in 0..5 {
+                    tx.send(Ok(n)).await.unwrap();
+                }
+                Ok("done")
+            })
+            .await;
+        let (summary, items) = result.unwrap();
+        assert_eq!(summary, "done");
+        assert_eq!(items, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn with_summary_producer_error_propagates() {
+        let result: Result<(&'static str, Vec<u32>), &'static str> =
+            collect_stream_with_summary(|tx| async move {
+                tx.send(Ok(1)).await.unwrap();
+                Err("boom")
+            })
+            .await;
         assert_eq!(result, Err("boom"));
     }
 }

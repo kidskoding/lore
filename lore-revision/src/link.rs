@@ -857,7 +857,7 @@ pub async fn link_has_content_divergence(
     current_branch: BranchId,
     current_revision: Hash,
 ) -> bool {
-    let diff = crate::branch::diff3_collect(
+    let diff = Box::pin(crate::branch::diff3_collect(
         link_context.clone(),
         source_branch,
         source_revision,
@@ -866,7 +866,7 @@ pub async fn link_has_content_divergence(
         None,
         false,
         false,
-    )
+    ))
     .await;
 
     match diff {

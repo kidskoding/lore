@@ -499,7 +499,7 @@ async fn merge_repository(
         return Err(MergeError::internal("Cannot merge a branch with itself"));
     }
 
-    let diff = branch::diff3_collect(
+    let diff = Box::pin(branch::diff3_collect(
         repository.clone(),
         source_branch,
         revision,
@@ -508,7 +508,7 @@ async fn merge_repository(
         None,  /* No path */
         true,  /* Include identical changes for merge tracking */
         false, /* Do not autoresolve, this is done later */
-    )
+    ))
     .await
     .forward::<MergeError>("running diff3 for merge")?;
 
@@ -2442,7 +2442,7 @@ pub async fn merge_restart(
         .await
         .forward::<MergeError>("loading merge revision metadata")?;
 
-    let diff = branch::diff3_collect(
+    let diff = Box::pin(branch::diff3_collect(
         repository.clone(),
         state_merge_metadata.branch,
         state_staged.parent_other(),
@@ -2451,7 +2451,7 @@ pub async fn merge_restart(
         None,
         true,  /* Include identical changes for merge tracking */
         false, /* Do not autoresolve, this is done later */
-    )
+    ))
     .await
     .forward::<MergeError>("running diff3 for merge restart")?;
     apply_restart_diff(

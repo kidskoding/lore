@@ -125,7 +125,7 @@ pub async fn diff(
         ));
     }
 
-    let diff = branch::diff3_collect(
+    let diff = Box::pin(branch::diff3_collect(
         repository,
         source_branch.id,
         source_latest,
@@ -134,7 +134,7 @@ pub async fn diff(
         path,
         false, /* Do not include identical changes */
         auto_resolve,
-    )
+    ))
     .await?;
 
     branch::dispatch_diff_events(&diff);

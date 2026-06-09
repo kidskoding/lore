@@ -52,6 +52,7 @@ pub struct LoreThinClientV1Service {
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     rpc_timeout: Duration,
+    revision_diff_config: revision_diff::RevisionDiffConfig,
     #[allow(dead_code)]
     instrument_provider: ThinClientServiceInstrumentProvider,
 }
@@ -61,11 +62,13 @@ impl LoreThinClientV1Service {
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         rpc_timeout: Duration,
+        revision_diff_config: revision_diff::RevisionDiffConfig,
     ) -> Self {
         Self {
             immutable_store,
             mutable_store,
             rpc_timeout,
+            revision_diff_config,
             instrument_provider: ThinClientServiceInstrumentProvider,
         }
     }
@@ -117,6 +120,7 @@ impl ThinClientService for LoreThinClientV1Service {
             request,
             self.immutable_store.clone(),
             self.mutable_store.clone(),
+            self.revision_diff_config,
         )
         .await
     }

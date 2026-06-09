@@ -18,7 +18,7 @@ use crate::lore::Hash;
 use crate::node::INVALID_NODE;
 use crate::repository::RepositoryContext;
 use crate::state::State;
-use crate::util::collect_stream::collect_stream;
+use crate::util::collect_stream::collect_stream_with_summary;
 use crate::util::path::RelativePath;
 
 #[repr(C)]
@@ -115,7 +115,7 @@ pub async fn diff(
         .await
         .forward::<DiffError>("deserializing target state")?;
 
-    let mut diff = collect_stream(|tx| {
+    let (_, mut diff) = collect_stream_with_summary(|tx| {
         diff::diff_revision_paths(repository.clone(), state_source, state_target, paths, tx)
     })
     .await

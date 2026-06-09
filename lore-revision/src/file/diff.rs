@@ -28,7 +28,7 @@ use crate::repository::RepositoryContext;
 use crate::revision;
 use crate::state;
 use crate::state::State;
-use crate::util::collect_stream::collect_stream;
+use crate::util::collect_stream::collect_stream_with_summary;
 use crate::util::encoding::decode_text_for_display;
 use crate::util::encoding::is_utf16_bom;
 use crate::util::path::RelativePath;
@@ -186,7 +186,7 @@ pub async fn diff(
     };
 
     if diff3 {
-        file_diff3(
+        Box::pin(file_diff3(
             repository,
             state_source,
             state_target,
@@ -194,7 +194,7 @@ pub async fn diff(
             revision_target,
             paths,
             options,
-        )
+        ))
         .await
     } else {
         file_diff2(repository, state_source, state_target, paths, options).await
@@ -209,7 +209,7 @@ async fn file_diff2(
     options: DiffOptions,
 ) -> Result<(), DiffError> {
     let changes = if let Some(state_target) = state_target.as_ref() {
-        let mut changes = collect_stream(|tx| {
+        let (_, mut changes) = collect_stream_with_summary(|tx| {
             diff::diff_revision_paths(
                 repository.clone(),
                 state_source.clone(),
@@ -285,7 +285,7 @@ async fn file_diff3(
     // Swap CLI args to match branch::diff3's convention:
     //   CLI --source (baseline) → branch::diff3 target
     //   CLI --target → branch::diff3 source
-    let diff_result = branch::diff3_collect(
+    let diff_result = Box::pin(branch::diff3_collect(
         repository.clone(),
         target_branch,
         target_revision_for_diff3,
@@ -294,7 +294,7 @@ async fn file_diff3(
         None,
         true, // include_same: surface auto-resolved files in changes
         false,
-    )
+    ))
     .await
     .internal("Failed to calculate diff")?;
 

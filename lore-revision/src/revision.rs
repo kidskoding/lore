@@ -27,6 +27,7 @@ use crate::change;
 use crate::change::FileAction;
 use crate::change::NodeChange;
 use crate::change::is_conflict;
+use crate::errors::Oversized;
 use crate::errors::RevisionNotFound;
 use crate::event;
 use crate::filter::Filter;
@@ -37,7 +38,6 @@ use crate::interface::LoreString;
 use crate::lore::*;
 use crate::lore_debug;
 use crate::lore_info;
-use crate::lore_trace;
 use crate::lore_warn;
 use crate::metadata;
 use crate::metadata::Metadata;
@@ -167,6 +167,17 @@ pub enum DiffItem {
     Conflict(Box<(NodeChange, NodeChange)>),
 }
 
+/// Per-conflict history-walk result, returned by tasks spawned in the
+/// parallel history-walk pass. `index` is the conflict's position in
+/// `joined_conflicts`, used to re-order outcomes deterministically
+/// after the `JoinSet` drains in completion order.
+#[derive(Debug, Clone, Copy)]
+struct HistoryWalkOutcome {
+    index: usize,
+    is_merged_from_source: bool,
+    is_merged_from_target: bool,
+}
+
 /// The small fixed-size facts a streaming 3-way diff reports after the stream
 /// completes. Replaces the non-streaming fields of `DiffResult` (everything
 /// except the `changes` / `conflicts` vectors, which are streamed instead).
@@ -180,18 +191,65 @@ pub struct Diff3Summary {
     pub target: Hash,
 }
 
+/// Returns `None` when any `Filter` builder call fails, signalling
+/// the caller to fall back to the unfiltered walk. The pre-streaming
+/// implementation absorbed these errors silently into a boolean —
+/// the explicit `Option` keeps that fallback path observable.
+fn filter_from_source_changes(source_changes: &[NodeChange]) -> Option<Filter> {
+    let mut filter = Filter::default();
+    if let Err(err) = filter.view.add_exclusion("**") {
+        lore_warn!("Failed to add target filter global exclusion: {err}");
+        return None;
+    }
+    for change in source_changes.iter() {
+        if let Err(err) = filter.view.add_inclusion(change.path.as_str()) {
+            lore_warn!("Failed to add target filter re-inclusion: {err}");
+            return None;
+        }
+        if let Some(from_path) = change.from_path.as_ref()
+            && let Err(err) = filter.view.add_inclusion(from_path.as_str())
+        {
+            lore_warn!("Failed to add target filter re-inclusion of from path: {err}");
+            return None;
+        }
+    }
+    Some(filter)
+}
+
+/// Threshold above which `diff3_collect` skips building a source-derived
+/// path filter for target's walk. Tuned to bound filter-construction
+/// cost; above this the unfiltered walk is cheaper.
+const SOURCE_FILTER_THRESHOLD: usize = 10_000;
+
 #[allow(clippy::doc_overindented_list_items)]
-/// Streaming wrapper around `diff3_collect`. Computes the 3-way diff
-/// internally (the algorithm requires both intermediate sets present for
-/// its sort-merge-join and conflict-resolution passes), then emits each
-/// resulting change and conflict as a `DiffItem` on `tx`. Returns a
-/// `Diff3Summary` carrying the base / source / target revisions.
+/// Streaming 3-way diff. Drains source's `state::diff` into a sorted
+/// `Vec`, then walks target streaming, joining each target change
+/// against source via binary search and resolving conflicts /
+/// post-merge fixups as items flow through. Memory bound is O(source
+/// diff size); target streams without materialising.
 ///
-/// Memory note: 3-way diff intrinsically buffers both base→source and
-/// base→target intermediate sets during merge — this wrapper provides the
-/// streaming surface for delivery but does not reduce the internal
-/// buffering. See LEP `2026-05-12-streaming-revision-diff-engine.md`
-/// Assumption #2 for the design rationale.
+/// Algorithm:
+/// 1. Walk base→source via `state::diff_collect`, retain non-trivial
+///    changes, sort by path (matches today's `diff3_collect` head).
+/// 2. When source has fewer than `SOURCE_FILTER_THRESHOLD` changes,
+///    derive a path-include filter and scope target's walk to
+///    source-touched paths (preserves today's optimization and its
+///    observable-output side-effect — see spec Open Question #1).
+/// 3. Stream target via `state::diff` into a bounded channel. For each
+///    target change, binary-search source by path. Equal-path pairs
+///    resolve via `is_conflict`; target-only changes emit if the
+///    filter is not active or path is filter-included.
+/// 4. Buffer joined output internally to fold three post-merge passes
+///    (`Move + from_path`, directory-delete overlap, history-walk
+///    resolution) before emitting. History-walk runs in parallel via
+///    a semaphore-bounded `JoinSet` (see the
+///    `history_walk_concurrency` parameter of
+///    `diff3_with_source_cap`, defaulting to
+///    `DEFAULT_HISTORY_WALK_CONCURRENCY`).
+///
+/// Returns a `Diff3Summary` carrying the base / source / target
+/// revisions. Items emit on `tx` as `DiffItem::Change` or
+/// `DiffItem::Conflict`.
 pub async fn diff3(
     repository: Arc<RepositoryContext>,
     base: Hash,
@@ -201,50 +259,50 @@ pub async fn diff3(
     include_same: bool,
     tx: mpsc::Sender<Result<DiffItem, StateError>>,
 ) -> Result<Diff3Summary, StateError> {
-    let diff = diff3_collect(repository, base, source, target, path, include_same).await?;
-    let summary = Diff3Summary {
-        base: diff.base,
-        source: diff.source,
-        target: diff.target,
-    };
-    for change in diff.changes {
-        tx.send(Ok(DiffItem::Change(change)))
-            .await
-            .map_err(|_send_err| StateError::internal("3-way diff receiver dropped"))?;
-    }
-    for (source_change, target_change) in diff.conflicts {
-        tx.send(Ok(DiffItem::Conflict(Box::new((
-            source_change,
-            target_change,
-        )))))
-        .await
-        .map_err(|_send_err| StateError::internal("3-way diff receiver dropped"))?;
-    }
-    Ok(summary)
+    diff3_with_source_cap(
+        repository,
+        base,
+        source,
+        target,
+        path,
+        include_same,
+        None,
+        None,
+        tx,
+    )
+    .await
 }
 
-#[allow(clippy::doc_overindented_list_items)]
-/// Calculate the difference between two revisions with a common base ancestor,
-/// as the set of changes that describe applying the delta between source and base
-/// on top of target. This works by calculating
-///  - `diff(base, source)`: The set of changes describing delta from base to source, `ds`
-///  - `diff(base, target)`: The set of changes describing delta from base to target, `dt`
-///  - `ds - dt`: The set difference between ds and dt, i.e the set of changes that are
-///               in ds but not in dt. That is, the set of changes performed between
-///               base and source that has not been performed between base and target.
-///               Any identical operation in both sets is thus ignored. This also takes
-///               merges into account by walking file histories.
+/// Default in-flight count for the history-walk parallel pass when
+/// the caller does not supply an explicit value. Set empirically via
+/// `~/perf/perfkit` on a 100k 3-way fixture: wall-clock improvement
+/// from parallelism plateaus around 24, while peak RSS climbs with
+/// each additional in-flight walk (each pins an `Arc<State>` for a
+/// deserialised revision blob).
+pub const DEFAULT_HISTORY_WALK_CONCURRENCY: usize = 24;
+
+/// `diff3` with optional tunables.
 ///
-/// Result is the unique set of changes that occurred between base and source, and a
-/// set of conflicting changes.
-pub async fn diff3_collect(
+/// * `source_cap` — abort with `StateError::Oversized` when source's
+///   `diff_collect` produces more than `n` items. The error message
+///   includes the cap and the produced count. Bounds peak memory for
+///   callers that need a ceiling. Library callers (filesystem diff,
+///   merge, capi, CLI) pass `None` via `diff3` to stay unbounded.
+/// * `history_walk_concurrency` — permit count for the semaphore
+///   gating parallel `is_last_change_merged` history walks. Passing
+///   `None` falls back to `DEFAULT_HISTORY_WALK_CONCURRENCY`.
+#[allow(clippy::too_many_arguments)]
+pub async fn diff3_with_source_cap(
     repository: Arc<RepositoryContext>,
     base: Hash,
     source: Hash,
     target: Hash,
     path: Option<RelativePath>,
     include_same: bool,
-) -> Result<DiffResult, StateError> {
+    source_cap: Option<usize>,
+    history_walk_concurrency: Option<usize>,
+    tx: mpsc::Sender<Result<DiffItem, StateError>>,
+) -> Result<Diff3Summary, StateError> {
     let (state_base, state_source, state_target) = join!(
         State::deserialize(repository.clone(), base),
         State::deserialize(repository.clone(), source),
@@ -256,247 +314,193 @@ pub async fn diff3_collect(
         .revision_metadata(repository.clone())
         .await?
         .branch;
-
     let target_branch = state_target
         .revision_metadata(repository.clone())
         .await?
         .branch;
 
-    let base_revision_number = state_base.revision_number();
-    let source_revision_number = state_source.revision_number();
-    let target_revision_number = state_target.revision_number();
     lore_info!(
-        "Calculating diff between\n  base {} -> {}\n  source {} -> {}\n  target {} -> {}",
-        base_revision_number,
+        "Calculating 3-way diff between\n  base {} -> {}\n  source {} -> {}\n  target {} -> {}",
+        state_base.revision_number(),
         state_base.revision(),
-        source_revision_number,
+        state_source.revision_number(),
         state_source.revision(),
-        target_revision_number,
+        state_target.revision_number(),
         state_target.revision()
     );
 
-    // Find the changes on source branch first in order to use this as a filter to target branch.
-    // This improves performance when diffing a feature branch with low churn onto a main branch
-    // with high churn, by reducing the number of considered changes by an order of magnitude
-    lore_info!("Diff source branch revisions");
-    let mut source_changes = state::diff_collect(
-        repository.clone(),
-        state_base.clone(),
-        repository.clone(),
-        state_source.clone(),
-        path.clone(),
-        FilterMode::View,
-    )
-    .await?;
-
-    // Ignore source changes that just indicate a change in file ID
-    source_changes.retain(|change| {
-        change.from.address.hash.is_zero()
-            || change.action == FileAction::Move
-            || change.from.address.hash != change.to.address.hash
+    // Stream source so the cap fires mid-walk: drop the channel and
+    // abort the producer as soon as we cross `source_cap`, instead of
+    // paying for a full walk that we're going to reject. Surfaces as
+    // `StateError::Oversized` so callers can map to
+    // `Status::resource_exhausted` via `is_oversized()` without
+    // string-matching across crates.
+    lore_info!("Diff source branch revisions (streaming)");
+    let (source_tx, mut source_rx) = mpsc::channel::<Result<NodeChange, StateError>>(256);
+    let source_walker_repo = repository.clone();
+    let source_walker_state_base = state_base.clone();
+    let source_walker_state_source = state_source.clone();
+    let source_walker_path = path.clone();
+    let source_walker = lore_spawn!(async move {
+        let mut sink = state::ChangeSink::Channel(&source_tx);
+        state::diff(
+            source_walker_repo.clone(),
+            source_walker_state_base,
+            source_walker_repo,
+            source_walker_state_source,
+            source_walker_path,
+            &mut sink,
+            FilterMode::View,
+        )
+        .await
     });
+
+    let mut source_changes: Vec<NodeChange> = Vec::new();
+    let mut oversized = false;
+    while let Some(item) = source_rx.recv().await {
+        let change = match item {
+            Ok(c) => c,
+            Err(err) => {
+                drop(source_rx);
+                let _ = source_walker.await;
+                return Err(err);
+            }
+        };
+        let is_file_id_only_churn = !change.from.address.hash.is_zero()
+            && change.action != FileAction::Move
+            && change.from.address.hash == change.to.address.hash;
+        if is_file_id_only_churn {
+            continue;
+        }
+        source_changes.push(change);
+        if let Some(cap) = source_cap
+            && source_changes.len() > cap
+        {
+            oversized = true;
+            break;
+        }
+    }
+    if oversized {
+        // Drop the receiver so the producer's next `send` errors on
+        // closed channel and `state::diff` exits naturally — no abort,
+        // so an in-flight side effect inside `state::diff` is allowed
+        // to complete before the task ends.
+        drop(source_rx);
+        let _ = source_walker.await;
+        return Err(StateError::from(Oversized {
+            context: format!(
+                "source-side diff change count exceeds configured limit of {}",
+                source_cap.unwrap_or(0)
+            ),
+        }));
+    }
+    match source_walker.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(err),
+        Err(join_err) => {
+            return Err(StateError::internal_with_context(
+                join_err,
+                "3-way diff source walker task failed",
+            ));
+        }
+    }
+    state::detect_and_coalesce_moves(&mut source_changes);
 
     lore_info!("Sorting {} source changes", source_changes.len());
     change::sort_by_path(&mut source_changes);
 
-    let mut filter_from_source = false;
-    let target_filter = if source_changes.len() < 10000 {
-        filter_from_source = true;
-        let mut target_filter = Filter::default();
-        if let Err(err) = target_filter.view.add_exclusion("**") {
-            filter_from_source = false;
-            lore_warn!("Failed to add target filter global exclusion: {err}");
-        } else {
-            for change in source_changes.iter() {
-                if let Err(err) = target_filter.view.add_inclusion(change.path.as_str()) {
-                    filter_from_source = false;
-                    lore_warn!("Failed to add target filter re-inclusion: {err}");
-                    break;
-                }
-                if let Some(from_path) = change.from_path.as_ref()
-                    && let Err(err) = target_filter.view.add_inclusion(from_path.as_str())
-                {
-                    filter_from_source = false;
-                    lore_warn!("Failed to add target filter re-inclusion of from path: {err}");
-                    break;
-                }
-            }
-        }
-        if filter_from_source {
-            Arc::new(target_filter)
-        } else {
-            repository.filter.clone()
-        }
+    let target_filter = if source_changes.len() < SOURCE_FILTER_THRESHOLD
+        && let Some(filter) = filter_from_source_changes(&source_changes)
+    {
+        Arc::new(filter)
     } else {
         repository.filter.clone()
     };
+    let target_repository = Arc::new(repository.to_filter_context(target_filter));
 
-    let repository = Arc::new(repository.to_filter_context(target_filter));
-
-    lore_info!("Diff target branch revisions");
-    let mut target_changes = state::diff_collect(
-        repository.clone(),
-        state_base.clone(),
-        repository.clone(),
-        state_target.clone(),
-        path.clone(),
-        FilterMode::View,
-    )
-    .await?;
-
-    // Ignore target changes that just indicate a change in file ID
-    target_changes.retain(|change| {
-        change.from.address.hash.is_zero() || change.from.address.hash != change.to.address.hash
+    lore_info!("Diff target branch revisions (streaming)");
+    let (target_tx, mut target_rx) = mpsc::channel::<Result<NodeChange, StateError>>(256);
+    let walker_repo = target_repository.clone();
+    let walker_state_base = state_base.clone();
+    let walker_path = path.clone();
+    let walker = lore_spawn!(async move {
+        let mut sink = state::ChangeSink::Channel(&target_tx);
+        state::diff(
+            walker_repo.clone(),
+            walker_state_base,
+            walker_repo,
+            state_target,
+            walker_path,
+            &mut sink,
+            FilterMode::View,
+        )
+        .await
     });
 
-    if filter_from_source {
-        lore_info!("Sorting {} filtered target changes", target_changes.len());
-    } else {
-        lore_info!("Sorting {} target changes", target_changes.len());
-    }
-    change::sort_by_path(&mut target_changes);
-
-    if filter_from_source {
-        lore_info!(
-            "Found {} changes on source branch, resulting in {} filtered changes on target branch",
-            source_changes.len(),
-            target_changes.len()
-        );
-    } else {
-        lore_info!(
-            "Found {} changes on source branch, {} changes on target branch",
-            source_changes.len(),
-            target_changes.len()
-        );
-    }
-
-    let mut diff = DiffResult {
-        base,
-        source,
-        target,
-        changes: vec![],
-        conflicts: vec![],
-    };
-
-    // Merge the sorted changes
-    let mut isource = 0;
-    let mut itarget = 0;
-    while isource < source_changes.len() && itarget < target_changes.len() {
-        let source_change = &source_changes[isource];
-        let target_change = &target_changes[itarget];
-        let compare = target_change.path.as_str().cmp(source_change.path.as_str());
-        match compare {
-            std::cmp::Ordering::Equal => {
-                if is_conflict(source_change, target_change, true).await? {
-                    let mut source_change = source_change.clone();
-                    let mut target_change = target_change.clone();
-                    source_change.flags = change::Flags::Conflict;
+    // Join loop: target streams in; source lives in the sorted Vec.
+    // Items emit via `out` (the joined working set) so post-merge
+    // passes can fold inline before the final emission to `tx`.
+    let mut joined_changes: Vec<NodeChange> = Vec::new();
+    let mut joined_conflicts: Vec<(NodeChange, NodeChange)> = Vec::new();
+    let mut source_consumed = vec![false; source_changes.len()];
+    while let Some(item) = target_rx.recv().await {
+        let mut target_change = match item {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(e);
+            }
+        };
+        let is_file_id_only_churn = !target_change.from.address.hash.is_zero()
+            && target_change.from.address.hash == target_change.to.address.hash;
+        if is_file_id_only_churn {
+            continue;
+        }
+        match source_changes.binary_search_by(|c| c.path.as_str().cmp(target_change.path.as_str()))
+        {
+            Ok(idx) => {
+                source_consumed[idx] = true;
+                let source_change = &source_changes[idx];
+                if is_conflict(source_change, &target_change, true).await? {
+                    let mut sc = source_change.clone();
+                    sc.flags = change::Flags::Conflict;
                     target_change.flags = change::Flags::Conflict;
-                    diff.conflicts.push((source_change, target_change));
-                } else if include_same {
-                    if diff.changes.is_empty()
-                        || diff.changes[diff.changes.len() - 1].path != source_change.path
-                    {
-                        lore_trace!(
-                            "Including identical source change {isource} {}",
-                            source_change.path.as_str()
-                        );
-                        diff.changes.push(source_change.clone());
-                    } else {
-                        lore_trace!(
-                            "Identical source change {isource} {} already included",
-                            source_change.path.as_str()
-                        );
-                    }
-                }
-                itarget += 1;
-                isource += 1;
-            }
-            std::cmp::Ordering::Less => {
-                diff.changes.push(target_change.clone());
-                itarget += 1;
-            }
-            std::cmp::Ordering::Greater => {
-                diff.changes.push(source_change.clone());
-                isource += 1;
-            }
-        }
-    }
-
-    while itarget < target_changes.len() {
-        diff.changes.push(target_changes[itarget].clone());
-        itarget += 1;
-    }
-    while isource < source_changes.len() {
-        diff.changes.push(source_changes[isource].clone());
-        isource += 1;
-    }
-
-    // Handle Move + other-change-at-from-path interactions:
-    // When a source Move has from_path=X and another change exists at path X:
-    // - If the other change is a Delete (divergent move): pair as conflict
-    // - If the Move didn't change content (pure rename) and other is Keep/Modify:
-    //   absorb into the Move (the rename preserves the modified content)
-    // - If the Move also changed content and other is Keep/Modify:
-    //   pair as conflict (both branches modified content differently)
-    {
-        let mut from_path_conflict_pairs: Vec<(usize, usize)> = Vec::new();
-        let mut from_path_absorbed: Vec<usize> = Vec::new();
-        for (outer_index, change_move) in diff.changes.iter().enumerate() {
-            if change_move.action == FileAction::Move
-                && let Some(ref from_path) = change_move.from_path
-            {
-                for (inner_index, change_match) in diff.changes.iter().enumerate() {
-                    if outer_index != inner_index
-                        && change_match.path.as_str() == from_path.as_str()
-                    {
-                        if change_match.action == FileAction::Delete {
-                            // Divergent move: pair as conflict
-                            from_path_conflict_pairs.push((outer_index, inner_index));
-                        } else if change_move.from.address.hash == change_move.to.address.hash {
-                            // Pure rename + modify on other branch: absorb the
-                            // modify since the rename preserves the modified content
-                            from_path_absorbed.push(inner_index);
-                        } else {
-                            // Move with content change + modify on other branch:
-                            // both branches changed content, pair as conflict
-                            from_path_conflict_pairs.push((outer_index, inner_index));
-                        }
-                    }
+                    joined_conflicts.push((sc, target_change));
+                } else if include_same
+                    && (joined_changes.is_empty()
+                        || joined_changes[joined_changes.len() - 1].path != source_change.path)
+                {
+                    joined_changes.push(source_change.clone());
                 }
             }
-        }
-        let mut remove = vec![false; diff.changes.len()];
-        for &absorbed_idx in from_path_absorbed.iter() {
-            remove[absorbed_idx] = true;
-        }
-        for &(move_idx, other_idx) in from_path_conflict_pairs.iter() {
-            if !remove[move_idx] && !remove[other_idx] {
-                let mut move_change = diff.changes[move_idx].clone();
-                let mut other_change = diff.changes[other_idx].clone();
-                move_change.flags = change::Flags::Conflict;
-                other_change.flags = change::Flags::Conflict;
-                diff.conflicts.push((move_change, other_change));
-                remove[move_idx] = true;
-                remove[other_idx] = true;
-            }
-        }
-        let mut i = diff.changes.len();
-        while i > 0 {
-            i -= 1;
-            if remove[i] {
-                diff.changes.remove(i);
+            Err(_) => {
+                joined_changes.push(target_change);
             }
         }
     }
 
-    if !diff.conflicts.is_empty() {
-        // If the changes list contains a deleted directory, remove it if there is a
-        // conflict in the conflicts list that overlaps the directory path.
-        // If there is no overlapping conflict, we keep it as it is a desired change.
-        diff.changes.retain(|item| {
+    match walker.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(err),
+        Err(join_err) => {
+            return Err(StateError::internal_with_context(
+                join_err,
+                "3-way diff target walker task failed",
+            ));
+        }
+    }
+
+    for (idx, consumed) in source_consumed.iter().enumerate() {
+        if !*consumed {
+            joined_changes.push(source_changes[idx].clone());
+        }
+    }
+
+    apply_move_from_path_pass(&mut joined_changes, &mut joined_conflicts);
+
+    if !joined_conflicts.is_empty() {
+        joined_changes.retain(|item| {
             if item.from.flags.is_directory() && item.action == FileAction::Delete {
-                for (from, _to) in diff.conflicts.iter() {
+                for (from, _to) in joined_conflicts.iter() {
                     if from.path.overlaps(&item.path) {
                         return false;
                     }
@@ -507,136 +511,245 @@ pub async fn diff3_collect(
         lore_debug!("Identify resolved conflicts through merges");
     }
 
-    // Iterate the conflicts and resolve against file history to
-    // see if conflict is already resolved by a previous merge.
-    // Cap the in-flight task count to bound peak memory — each task
-    // walks file history and may pin several `Arc<State>` instances
-    // (each with its own block cache) for the duration of the walk.
-    const MAX_TASK_COUNT: usize = 1000;
-    let mut merge_check_tasks = JoinSet::new();
-    let mut merge_error: Result<(), StateError> = Ok(());
-    let mut task_error: Result<(), StateError> = Ok(());
-    let mut final_conflicts = vec![];
-    for index in 0..diff.conflicts.len() {
-        let conflict = &diff.conflicts[index];
-        let state_base = state_base.clone();
-        let source_conflict = conflict.0.clone();
-        let target_conflict = conflict.1.clone();
-        lore_spawn!(merge_check_tasks, async move {
-            lore_debug!(
-                "Check if changes to {} are merged from target branch {} into source branch {}",
-                target_conflict.path.as_str(),
-                target_branch,
-                source_branch
-            );
+    // Producer loop acquires a permit before spawning, so the in-flight
+    // set never exceeds `permits` tasks — each in-flight walk pins an
+    // `Arc<State>` over a deserialised revision blob, and at 10k+
+    // conflicts unbounded fan-out blows past tens of GB of pinned state.
+    //
+    // No abort path: on error we stop spawning and let in-flight tasks
+    // finish naturally. Cancel-safety is not something the surrounding
+    // code is designed to tolerate today (e.g. a task aborted mid-write
+    // to a downstream channel could surface a partial value), so let
+    // them run to completion.
+    let permits = history_walk_concurrency.unwrap_or(DEFAULT_HISTORY_WALK_CONCURRENCY);
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(permits));
+    let mut history_walks: JoinSet<Result<HistoryWalkOutcome, StateError>> = JoinSet::new();
+    let mut outcomes: Vec<HistoryWalkOutcome> = Vec::with_capacity(joined_conflicts.len());
+    let mut walk_err: Option<StateError> = None;
+    for (idx, (source_conflict, target_conflict)) in joined_conflicts.iter().enumerate() {
+        let permit = match semaphore.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(err) => {
+                walk_err = Some(StateError::internal_with_context(
+                    err,
+                    "history-walk semaphore closed",
+                ));
+                break;
+            }
+        };
+        while let Some(joined) = history_walks.try_join_next() {
+            match joined {
+                Ok(Ok(outcome)) => outcomes.push(outcome),
+                Ok(Err(err)) => walk_err = walk_err.or(Some(err)),
+                Err(join_err) => {
+                    walk_err = walk_err.or(Some(StateError::internal_with_context(
+                        join_err,
+                        "history-walk task failed",
+                    )));
+                }
+            }
+        }
+        if walk_err.is_some() {
+            drop(permit);
+            break;
+        }
+        let source_conflict = source_conflict.clone();
+        let target_conflict = target_conflict.clone();
+        let state_branch_point = state_base.clone();
+        lore_spawn!(history_walks, async move {
+            let _permit = permit;
             let is_merged_from_target = is_last_change_merged(
                 target_conflict.clone(),
                 target_branch,
                 source_conflict.clone(),
                 source_branch,
-                state_base.clone(),
+                state_branch_point.clone(),
             )
             .await?;
-
-            lore_debug!(
-                "Check if changes to {} are merged from source branch {} into target branch {} {}",
-                source_conflict.path.as_str(),
-                source_branch,
-                target_branch,
-                target_conflict.path.as_str()
-            );
             let is_merged_from_source = is_last_change_merged(
                 source_conflict,
                 source_branch,
                 target_conflict,
                 target_branch,
-                state_base,
+                state_branch_point,
             )
             .await?;
-
-            Ok((index, is_merged_from_source, is_merged_from_target))
+            Ok(HistoryWalkOutcome {
+                index: idx,
+                is_merged_from_source,
+                is_merged_from_target,
+            })
         });
+    }
 
-        while merge_check_tasks.len() >= MAX_TASK_COUNT
-            && let Some(result) = merge_check_tasks.join_next().await
-        {
-            apply_merge_check_result(
-                result,
-                &mut diff,
-                &mut final_conflicts,
-                &mut merge_error,
-                &mut task_error,
+    while let Some(joined) = history_walks.join_next().await {
+        match joined {
+            Ok(Ok(outcome)) => outcomes.push(outcome),
+            Ok(Err(err)) => walk_err = walk_err.or(Some(err)),
+            Err(join_err) => {
+                walk_err = walk_err.or(Some(StateError::internal_with_context(
+                    join_err,
+                    "history-walk task failed",
+                )));
+            }
+        }
+    }
+    if let Some(err) = walk_err {
+        return Err(err);
+    }
+    outcomes.sort_unstable_by_key(|o| o.index);
+
+    let mut final_conflicts: Vec<(NodeChange, NodeChange)> = Vec::new();
+    for outcome in outcomes {
+        let (source_conflict, target_conflict) = &joined_conflicts[outcome.index];
+        if !outcome.is_merged_from_source && !outcome.is_merged_from_target {
+            lore_debug!("Conflict remains: {:?}", (source_conflict, target_conflict));
+            final_conflicts.push((source_conflict.clone(), target_conflict.clone()));
+        } else if !outcome.is_merged_from_source {
+            let mut change = source_conflict.clone();
+            lore_debug!(
+                "Conflict resolved: {:?}",
+                (source_conflict, target_conflict)
+            );
+            // If the file was added on source branch and either added or
+            // modified on target branch, show the change as modified.
+            if source_conflict.action == FileAction::Add
+                && target_conflict.action != FileAction::Delete
+            {
+                change.action = FileAction::Keep;
+            }
+            // Since the target was merged into source, the change is
+            // actually from the target state to the source current
+            // latest state.
+            change.from = target_conflict.to.clone();
+            joined_changes.push(change);
+        } else {
+            lore_debug!(
+                "Conflict resolved, source change merged: {:?}",
+                (source_conflict, target_conflict)
             );
         }
     }
-
-    while let Some(result) = merge_check_tasks.join_next().await {
-        apply_merge_check_result(
-            result,
-            &mut diff,
-            &mut final_conflicts,
-            &mut merge_error,
-            &mut task_error,
-        );
-    }
-    merge_error?;
-    task_error?;
-
-    diff.conflicts = final_conflicts;
-    if !diff.conflicts.is_empty() {
-        lore_debug!("Final {} conflicts", diff.conflicts.len());
+    if !final_conflicts.is_empty() {
+        lore_debug!("Final {} conflicts", final_conflicts.len());
     }
 
-    Ok(diff)
+    let summary = Diff3Summary {
+        base,
+        source,
+        target,
+    };
+
+    for change in joined_changes {
+        tx.send(Ok(DiffItem::Change(change)))
+            .await
+            .map_err(|_send_err| StateError::internal("3-way diff receiver dropped"))?;
+    }
+    for (source_change, target_change) in final_conflicts {
+        tx.send(Ok(DiffItem::Conflict(Box::new((
+            source_change,
+            target_change,
+        )))))
+        .await
+        .map_err(|_send_err| StateError::internal("3-way diff receiver dropped"))?;
+    }
+    Ok(summary)
 }
 
-fn apply_merge_check_result(
-    result: Result<Result<(usize, bool, bool), StateError>, tokio::task::JoinError>,
-    diff: &mut DiffResult,
-    final_conflicts: &mut Vec<(NodeChange, NodeChange)>,
-    merge_error: &mut Result<(), StateError>,
-    task_error: &mut Result<(), StateError>,
+/// Resolves `Move + other-change-at-from-path` interactions per the
+/// pre-streaming rules:
+///   - `Move(X→Y) + Delete(X)` → conflict (divergent move).
+///   - Pure rename `Move(X→Y, content unchanged) + Modify(X)` →
+///     absorb the modify into the rename (the rename carries the
+///     modified content).
+///   - `Move(X→Y, content changed) + Modify(X)` → conflict (both
+///     branches modified content differently).
+fn apply_move_from_path_pass(
+    changes: &mut Vec<NodeChange>,
+    conflicts: &mut Vec<(NodeChange, NodeChange)>,
 ) {
-    match result {
-        Ok(Ok((index, is_merged_from_source, is_merged_from_target))) => {
-            if !is_merged_from_source && !is_merged_from_target {
-                lore_debug!("Conflict remains: {:?}", diff.conflicts[index]);
-                final_conflicts.push(diff.conflicts[index].clone());
-            } else if !is_merged_from_source {
-                let mut change = diff.conflicts[index].0.clone();
-
-                lore_debug!("Conflict resolved: {:?}", diff.conflicts[index]);
-                lore_debug!("  source change remains: {:?}", change);
-
-                // If the file was added on source branch and either added or
-                // modified on target branch, show the change as modified
-                if diff.conflicts[index].0.action == FileAction::Add
-                    && diff.conflicts[index].1.action != FileAction::Delete
-                {
-                    change.action = FileAction::Keep;
+    let mut from_path_conflict_pairs: Vec<(usize, usize)> = Vec::new();
+    let mut from_path_absorbed: Vec<usize> = Vec::new();
+    for (outer_index, change_move) in changes.iter().enumerate() {
+        if change_move.action == FileAction::Move
+            && let Some(ref from_path) = change_move.from_path
+        {
+            for (inner_index, change_match) in changes.iter().enumerate() {
+                if outer_index != inner_index && change_match.path.as_str() == from_path.as_str() {
+                    if change_match.action == FileAction::Delete {
+                        from_path_conflict_pairs.push((outer_index, inner_index));
+                    } else if change_move.from.address.hash == change_move.to.address.hash {
+                        from_path_absorbed.push(inner_index);
+                    } else {
+                        from_path_conflict_pairs.push((outer_index, inner_index));
+                    }
                 }
-
-                // Since the target was merged into source, the change is actually
-                // from the target state to the source current latest state
-                change.from = diff.conflicts[index].1.to.clone();
-
-                diff.changes.push(change);
-            } else {
-                lore_debug!(
-                    "Conflict resolved, source change merged: {:?}",
-                    diff.conflicts[index]
-                );
             }
-        }
-        Ok(Err(err)) => {
-            if merge_error.is_ok() {
-                *merge_error = Err(err);
-            }
-        }
-        Err(_) => {
-            *task_error = Err(StateError::internal("Task failure"));
         }
     }
+    let mut remove = vec![false; changes.len()];
+    for &absorbed_idx in from_path_absorbed.iter() {
+        remove[absorbed_idx] = true;
+    }
+    for &(move_idx, other_idx) in from_path_conflict_pairs.iter() {
+        if !remove[move_idx] && !remove[other_idx] {
+            let mut move_change = changes[move_idx].clone();
+            let mut other_change = changes[other_idx].clone();
+            move_change.flags = change::Flags::Conflict;
+            other_change.flags = change::Flags::Conflict;
+            conflicts.push((move_change, other_change));
+            remove[move_idx] = true;
+            remove[other_idx] = true;
+        }
+    }
+    let mut i = changes.len();
+    while i > 0 {
+        i -= 1;
+        if remove[i] {
+            changes.remove(i);
+        }
+    }
+}
+
+/// `Vec`-returning drain over streaming `diff3`. Exists so callers
+/// that need the whole set materialised (filesystem diff, merge, capi,
+/// CLI, legacy handlers) keep the historical `DiffResult` contract.
+pub async fn diff3_collect(
+    repository: Arc<RepositoryContext>,
+    base: Hash,
+    source: Hash,
+    target: Hash,
+    path: Option<RelativePath>,
+    include_same: bool,
+) -> Result<DiffResult, StateError> {
+    let (summary, items) = crate::util::collect_stream::collect_stream_with_summary(|tx| {
+        diff3(repository, base, source, target, path, include_same, tx)
+    })
+    .await?;
+    Ok(diff_result_from_summary_and_items(summary, items))
+}
+
+/// Re-assemble a `DiffResult` from a drained streaming `diff3` output.
+/// Used by both `revision::diff3_collect` and `branch::diff3_collect`
+/// after `collect_stream_with_summary` returns.
+pub(crate) fn diff_result_from_summary_and_items(
+    summary: Diff3Summary,
+    items: Vec<DiffItem>,
+) -> DiffResult {
+    let mut diff = DiffResult {
+        base: summary.base,
+        source: summary.source,
+        target: summary.target,
+        changes: Vec::new(),
+        conflicts: Vec::new(),
+    };
+    for item in items {
+        match item {
+            DiffItem::Change(c) => diff.changes.push(c),
+            DiffItem::Conflict(pair) => diff.conflicts.push(*pair),
+        }
+    }
+    diff
 }
 
 async fn is_last_change_merged(
