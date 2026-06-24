@@ -869,7 +869,7 @@ pub enum LoreError {
     /// The backing store is overloaded; the caller should retry later.
     SlowDown = 5,
     /// A blob exceeded a size limit enforced by the caller or the protocol.
-    /// Discriminant matches the FFI code of the underlying `Oversized` struct
+    /// Discriminant matches the error code of the underlying `Oversized` struct
     /// in `lore-base` so callers see a single consistent code.
     Oversized = 26,
 

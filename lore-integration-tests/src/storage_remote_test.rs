@@ -2879,7 +2879,7 @@ mod storage_remote_tests {
 
                 let (status, value, code) =
                     mutable_load_via_handle(handle_id, remote_globals(), partition, key).await;
-                assert_eq!(status, 1);
+                assert_ne!(status, 0);
                 assert_eq!(code, LoreErrorCode::AddressNotFound);
                 assert_eq!(value, Hash::default());
 
